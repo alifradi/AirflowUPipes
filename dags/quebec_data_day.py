@@ -31,7 +31,8 @@ def process_dataset(dataset_key: str, dataset_info: dict):
                 ssl_verify=False,
                 connection=conn,
                 table_name=table_name,
-                schema_name=POSTGRES_SCHEMA
+                schema_name=POSTGRES_SCHEMA,
+                batch_size=1000  # Ensure batch_size is within valid range
             )
     print(f"Loaded {dataset_name} to {POSTGRES_SCHEMA}.{table_name} with {total_rows} rows.")
 
