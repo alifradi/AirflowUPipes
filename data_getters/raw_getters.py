@@ -109,7 +109,7 @@ MTL_MAP = {
     'mtl_fines_food': {
         'resource_id': '7f939a08-be8a-45e1-b208-d8744dca8fc6',
         'has_coords': False,
-        'category': 'alimentaires'
+        'category': 'alimentaires'}
     }
 
 def fetch_and_store_ontario_dataset(
