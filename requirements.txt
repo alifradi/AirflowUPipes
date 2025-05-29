@@ -1,0 +1,8 @@
+pandas
+pandera
+requests
+SQLAlchemy
+psycopg2-binary
+apache-airflow==2.9.2
+apache-airflow-providers-postgres
+# openpyxl
