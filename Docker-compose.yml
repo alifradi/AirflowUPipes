@@ -45,7 +45,7 @@ services:
 
   airflow-webserver:
     <<: *airflow-common
-    # user: "${UID}:0"  # Kept commented out to run as root (diagnostic for permission issues)
+    user: "${UID}:0"  # Kept commented out to run as root (diagnostic for permission issues)
     container_name: airflow_webserver
     command: airflow webserver
     ports:
@@ -62,7 +62,7 @@ services:
 
   airflow-scheduler:
     <<: *airflow-common
-    # user: "${UID}:0"  # Kept commented out to run as root (diagnostic for permission issues)
+    user: "${UID}:0"  # Kept commented out to run as root (diagnostic for permission issues)
     container_name: airflow_scheduler
     command: airflow scheduler
     restart: always
