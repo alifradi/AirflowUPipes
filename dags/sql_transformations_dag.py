@@ -16,98 +16,158 @@ import logging # Add logging
 # Ensure correct import path if db_utils is in a subfolder like 'common'
 from common.db_utils import get_db_connection, create_schema_if_not_exists, execute_sql_statement
 # Import MTL_MAP and geocoding utilities
-from data_getters.raw_getters import MTL_MAP #
+from data_getters.raw_getters import MTL_MAP, TO_MAP
 from common.geocoding_utils import preprocess_addresses, geocode_batch_parallel, apply_coordinates_to_dataframe
 
+# Function to check if a table has coordinates
+def has_coordinates(table_name):
+    """Check if a table has latitude/longitude columns"""
+    with get_db_connection() as conn:
+        query = f"""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = '{table_name}' 
+            AND (column_name ILIKE '%lat%' OR column_name ILIKE '%long%');
+        """
+        df = pd.read_sql(query, conn)
+        return not df.empty
+
+# Function to check if a table has address column
+def has_address_column(table_name):
+    """Check if a table has an address column"""
+    with get_db_connection() as conn:
+        query = f"""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = '{table_name}' 
+            AND column_name ILIKE '%address%';
+        """
+        df = pd.read_sql(query, conn)
+        return not df.empty
+
+# Function to determine tables needing geocoding
+def get_tables_needing_geocoding():
+    """Get list of tables that need geocoding"""
+    tables_needing_geocoding = []
+    
+    # Check TO_MAP tables
+    for table_name, info in TO_MAP.items():
+        if not info.get('has_coords', False) and has_address_column(table_name):
+            tables_needing_geocoding.append(table_name)
+    
+    # Check MTL_MAP tables
+    for table_name, info in MTL_MAP.items():
+        if not info.get('has_coords', False) and has_address_column(table_name):
+            tables_needing_geocoding.append(table_name)
+    
+    return tables_needing_geocoding
+
 TRANSFORMED_SCHEMA = 'public_transformed_data' #
-SQL_FILE_PATH = os.path.join(os.path.dirname(__file__), 'yakin sep tables.sql') #
+QUEBEC_SQL_FILE_PATH = os.path.join(os.path.dirname(__file__), 'quebec_transformations.sql')
+ONTARIO_SQL_FILE_PATH = os.path.join(os.path.dirname(__file__), 'ontario_transformations.sql')
 
 # Setup logger for the DAG file
 dag_logger = logging.getLogger("airflow.task")
 
 
-def run_sql_transformations_func(**context): #
+def run_sql_transformations_func(**context):
     """
-    Reads the SQL file as a Jinja2 template, renders it with the execution date,
+    Runs Quebec and Ontario transformation SQL scripts as part of the DAG.
+    Reads each SQL file as a Jinja2 template, renders it with the execution date,
     splits it into individual SELECT queries, wraps them in CREATE TABLE AS statements, and executes them.
     """
-    execution_date = context.get('execution_date') #
-    if execution_date is None: #
-        from airflow.utils.dates import days_ago #
-        execution_date = days_ago(0) #
-    data_pull_date = execution_date.strftime('%Y-%m-%d') #
+    execution_date = context.get('execution_date')
+    if execution_date is None:
+        from airflow.utils.dates import days_ago
+        execution_date = days_ago(0)
+    data_pull_date = execution_date.strftime('%Y-%m-%d')
 
-    with get_db_connection() as conn: #
-        with conn.begin(): # Use a transaction for schema creation and table creations #
-            create_schema_if_not_exists(TRANSFORMED_SCHEMA, conn) #
+    sql_files = [QUEBEC_SQL_FILE_PATH, ONTARIO_SQL_FILE_PATH]
+    with get_db_connection() as conn:
+        # Create the schema outside the transaction for transformations
+        dag_logger.info(f"Attempting to create schema: {TRANSFORMED_SCHEMA}")
+        try:
+            create_schema_if_not_exists(TRANSFORMED_SCHEMA, conn)
+            dag_logger.info(f"Schema '{TRANSFORMED_SCHEMA}' created or already exists.")
+        except Exception as e:
+            dag_logger.error(f"Failed to create schema '{TRANSFORMED_SCHEMA}': {e}")
+            raise  # Fail the task so you see the error
 
-            if not os.path.exists(SQL_FILE_PATH): #
-                raise FileNotFoundError(f"SQL file not found: {SQL_FILE_PATH}") #
+        with conn.begin():
+            for SQL_FILE_PATH in sql_files:
+                if not os.path.exists(SQL_FILE_PATH):
+                    dag_logger.warning(f"SQL file not found: {SQL_FILE_PATH}, skipping.")
+                    continue
+                dag_logger.info(f"Processing SQL file: {SQL_FILE_PATH}")
+                with open(SQL_FILE_PATH, 'r') as f:
+                    sql_template = Template(f.read())
+                    sql_content = sql_template.render(data_pull_date=data_pull_date)
 
-            with open(SQL_FILE_PATH, 'r') as f: #
-                sql_template = Template(f.read()) #
-                sql_content = sql_template.render(data_pull_date=data_pull_date) #
+                individual_select_queries = []
+                current_query_lines = []
+                for line in sql_content.splitlines():
+                    stripped_line = line.strip()
+                    if (stripped_line.upper().startswith("SELECT") or stripped_line.upper().startswith("WITH")) and current_query_lines:
+                        if "".join(current_query_lines).strip():
+                            individual_select_queries.append("\n".join(current_query_lines))
+                        current_query_lines = [line]
+                    elif stripped_line or current_query_lines:
+                        current_query_lines.append(line)
+                if current_query_lines and "".join(current_query_lines).strip():
+                    individual_select_queries.append("\n".join(current_query_lines))
 
-            individual_select_queries = [] #
-            current_query_lines = [] #
-            for line in sql_content.splitlines(): #
-                stripped_line = line.strip() #
-                if (stripped_line.upper().startswith("SELECT") or stripped_line.upper().startswith("WITH")) and current_query_lines: #
-                    if "".join(current_query_lines).strip(): #
-                        individual_select_queries.append("\n".join(current_query_lines)) #
-                    current_query_lines = [line] #
-                elif stripped_line or current_query_lines: #
-                    current_query_lines.append(line) #
-            if current_query_lines and "".join(current_query_lines).strip(): #
-                individual_select_queries.append("\n".join(current_query_lines)) #
+                if not individual_select_queries:
+                    dag_logger.info(f"No SQL queries found in the file {SQL_FILE_PATH}.")
+                    continue
 
-            if not individual_select_queries: #
-                dag_logger.info("No SQL queries found in the file.") #
-                return #
+                for i, select_query in enumerate(individual_select_queries):
+                    select_query = select_query.strip()
+                    if not select_query:
+                        continue
+                    # Skip queries that are only comments or blank lines
+                    lines = [line.strip() for line in select_query.splitlines() if line.strip()]
+                    if not lines or all(line.startswith('--') for line in lines):
+                        dag_logger.info(f"Skipping comment-only or empty query block at position {i+1} in {os.path.basename(SQL_FILE_PATH)}.")
+                        continue
 
-            for i, select_query in enumerate(individual_select_queries): #
-                select_query = select_query.strip() #
-                if not select_query: #
-                    continue #
+                    dag_logger.info(f"\nProcessing query {i+1}/{len(individual_select_queries)} from {os.path.basename(SQL_FILE_PATH)}:\n{select_query[:200]}...")
 
-                dag_logger.info(f"\nProcessing query {i+1}/{len(individual_select_queries)}:\n{select_query[:200]}...") #
+                    # Get source table name and schema
+                    source_table_name_in_sql = None
+                    # Match table names with or without quotes
+                    from_match = re.search(r"FROM\s+([\w\"]+(?:\.[\w\"]+)?)", select_query, re.IGNORECASE)
+                    if from_match:
+                        source_table_name_in_sql = from_match.group(1).strip('"')
+                    else:
+                        # Also check for table names in WITH clauses
+                        with_from_match = re.search(r"WITH\s+\w+\s+AS\s*\(\s*SELECT.*?\sFROM\s+([\w\"]+(?:\.[\w\"]+)?)", select_query, re.DOTALL | re.IGNORECASE)
+                        if with_from_match:
+                            source_table_name_in_sql = with_from_match.group(1).strip('"')
+                    if not source_table_name_in_sql:
+                        dag_logger.warning(f"WARNING: Could not determine a base table name for query: {select_query[:100]}... Using generic name 'transformed_query_{i+1}'.")
+                        transformed_table_name = f"transformed_query_{i+1}"
+                    else:
+                        transformed_table_name = f"tf_{source_table_name_in_sql.split('.')[-1].replace('"', '')}"
 
-                source_table_name_in_sql = None #
-                from_match = re.search(r"FROM\s+(?:[a-zA-Z0-9_]+\.)?([a-zA-Z0-9_]+)", select_query, re.IGNORECASE) #
-                if from_match: #
-                    source_table_name_in_sql = from_match.group(1) #
-                else: #
-                    with_from_match = re.search(r"WITH\s+\w+\s+AS\s*\(\s*SELECT.*?\sFROM\s+(?:[a-zA-Z0-9_]+\.)?([a-zA-Z0-9_]+)", select_query, re.DOTALL | re.IGNORECASE) #
-                    if with_from_match: #
-                        source_table_name_in_sql = with_from_match.group(1) #
-                if not source_table_name_in_sql: #
-                    dag_logger.warning(f"WARNING: Could not determine a base table name for query: {select_query[:100]}... Using generic name 'transformed_query_{i+1}'.") #
-                    output_table_name = f"transformed_query_{i+1}" #
-                else: #
-                    output_table_name = f"tf_{source_table_name_in_sql}" #
+                    # Drop existing transformed table first
+                    drop_sql = f"DROP TABLE IF EXISTS {TRANSFORMED_SCHEMA}.{transformed_table_name} CASCADE;"
+                    dag_logger.info(f"Executing: {drop_sql}")
+                    execute_sql_statement(drop_sql, conn)
 
-                def schema_replacer(match): #
-                    keyword = match.group(1) #
-                    table_name = match.group(2) #
-                    if table_name.startswith('mtl_'): #
-                        return f"{keyword}quebec_data.{table_name}" #
-                    elif table_name.startswith('to_'): #
-                        return f"{keyword}ontario_data.{table_name}" #
-                    return match.group(0) #
+                    # Create transformed table
+                    create_sql = f"""
+                        CREATE TABLE {TRANSFORMED_SCHEMA}.{transformed_table_name} AS
+                        {select_query}
+                    """
+                    dag_logger.info(f"Creating transformed table: {transformed_table_name}")
+                    try:
+                        execute_sql_statement(create_sql, conn)
+                        dag_logger.info(f"Successfully created table {TRANSFORMED_SCHEMA}.{transformed_table_name}")
+                    except Exception as e:
+                        dag_logger.error(f"ERROR creating table {TRANSFORMED_SCHEMA}.{transformed_table_name}: {e}")
+                        continue
 
-                transformed_select_query = re.sub(r'(FROM\s+|JOIN\s+)([a-zA-Z0-9_]+)', schema_replacer, select_query, flags=re.IGNORECASE) #
-                drop_table_sql = f"DROP TABLE IF EXISTS {TRANSFORMED_SCHEMA}.{output_table_name} CASCADE;" #
-                dag_logger.info(f"Executing: {drop_table_sql}") #
-                execute_sql_statement(drop_table_sql, conn) #
-
-                create_table_sql = f"CREATE TABLE {TRANSFORMED_SCHEMA}.{output_table_name} AS ({transformed_select_query});" #
-                dag_logger.info(f"Executing: CREATE TABLE {TRANSFORMED_SCHEMA}.{output_table_name} ...") #
-                try: #
-                    execute_sql_statement(create_table_sql, conn) #
-                    dag_logger.info(f"Successfully created table {TRANSFORMED_SCHEMA}.{output_table_name}") #
-                except Exception as e: #
-                    dag_logger.error(f"ERROR creating table {TRANSFORMED_SCHEMA}.{output_table_name}: {e}") #
-                    dag_logger.error(f"Failed SQL (approximate): {create_table_sql[:500]}...") #
+            dag_logger.info("All SQL file transformations completed.")
 
 
 def check_required_tables_exist(): #
@@ -163,96 +223,165 @@ class LatestDagSuccessSensor(BaseSensorOperator): #
 
 def geocode_transformed_data_func(**context):
     """
-    Geocodes datasets specified in MTL_MAP if they lack coordinates.
-    Reads from the transformed table, adds lat/lon, and writes back.
+    Geocodes transformed tables that have an address column but no coordinates.
+    Accepts max_workers and batch_size from Airflow context for parallel geocoding performance tuning.
     """
-    dag_logger.info("Starting geocoding process for transformed data.")
+    dag_logger.info("Starting geocoding of transformed tables...")
 
-    for dataset_key, dataset_info in MTL_MAP.items(): #
-        # Process if 'has_coords' is False. If key is missing, assume True (i.e., no geocoding needed).
-        if not dataset_info.get('has_coords', True):
-            dag_logger.info(f"Dataset {dataset_key} is marked for geocoding (has_coords: False).")
-            transformed_table_name = f"tf_{dataset_key}" # Based on convention in run_sql_transformations_func
-            
-            # Determine address column dynamically or use a mapping
-            # For 'mtl_fines_food', the transformed SQL output uses 'address'
-            address_column = dataset_info.get('address_column_transformed', 'address' if dataset_key == 'mtl_fines_food' else None)
+    # Get geocoding parallelism parameters from context or use defaults
+    max_workers = context.get('max_workers', 12)
+    batch_size = context.get('batch_size', 100)
 
-            if not address_column:
-                dag_logger.warning(f"No address column defined or inferable for {dataset_key} in its transformed version. Skipping geocoding.")
-                continue
+    with get_db_connection() as conn:
+        # Get all transformed tables
+        query = sqlalchemy.text(
+            """SELECT table_name FROM information_schema.tables 
+            WHERE table_schema = :schema AND table_name LIKE 'tf_%'"""
+        )
+        result = conn.execute(query, {'schema': TRANSFORMED_SCHEMA})
+        transformed_tables = [row[0] for row in result]
 
+        for table_name in transformed_tables:
             try:
-                with get_db_connection() as conn:
-                    # Check if table exists in the transformed schema
-                    # Using text() for sqlalchemy literal_binds compatibility if conn.execute is used directly
-                    check_table_query = sqlalchemy.text(
-                        f"SELECT EXISTS (SELECT FROM information_schema.tables "
-                        f"WHERE table_schema = :schema AND table_name = :table);"
-                    )
-                    table_exists_result = conn.execute(check_table_query, {'schema': TRANSFORMED_SCHEMA, 'table': transformed_table_name})
-                    table_exists = table_exists_result.scalar_one_or_none()
+                dag_logger.info(f"\nProcessing table: {table_name}")
+                
+                # Check if table has coordinates
+                has_coords_query = sqlalchemy.text(
+                    """SELECT column_name FROM information_schema.columns 
+                        WHERE table_schema = :schema 
+                        AND table_name = :table 
+                        AND (column_name = 'latitude' OR column_name = 'longitude')
+                    """
+                )
+                coords_result = conn.execute(has_coords_query, {'schema': TRANSFORMED_SCHEMA, 'table': table_name}).fetchall()
+                has_lat = any(row[0].lower() == 'latitude' for row in coords_result)
+                has_long = any(row[0].lower() == 'longitude' for row in coords_result)
 
+                # Check if table has an address column
+                has_address_query = sqlalchemy.text(
+                    """SELECT EXISTS (
+                        SELECT 1 FROM information_schema.columns 
+                        WHERE table_schema = :schema 
+                        AND table_name = :table 
+                        AND column_name = 'address'
+                    )"""
+                )
+                has_address = conn.execute(has_address_query, {'schema': TRANSFORMED_SCHEMA, 'table': table_name}).scalar_one_or_none()
 
-                    if not table_exists:
-                        dag_logger.warning(f"Table {TRANSFORMED_SCHEMA}.{transformed_table_name} does not exist. Skipping geocoding.")
+                if not has_address:
+                    dag_logger.info(f"Table {table_name} has no address column. Skipping geocoding.")
+                    continue
+
+                # If address exists but latitude/longitude do not, add them
+                if has_address and (not has_lat or not has_long):
+                    alter_sql = f"""
+                        ALTER TABLE {TRANSFORMED_SCHEMA}.{table_name}
+                        {'' if has_lat else 'ADD COLUMN latitude REAL,'}
+                        {'' if has_long else 'ADD COLUMN longitude REAL,'}
+                        """.replace(',\n"""', '\n"""').replace('ALTER TABLE', 'ALTER TABLE').strip()
+                    # Remove trailing comma and newline if present
+                    alter_sql = alter_sql.rstrip(',\n')
+                    dag_logger.info(f"Altering table {table_name} to add latitude/longitude columns if missing.")
+                    try:
+                        conn.execute(sqlalchemy.text(alter_sql))
+                        dag_logger.info(f"Successfully altered table {table_name}.")
+                    except Exception as e:
+                        dag_logger.warning(f"Could not alter table {table_name}: {e}")
                         continue
 
-                    dag_logger.info(f"Reading data from {TRANSFORMED_SCHEMA}.{transformed_table_name}")
-                    # Use pandas read_sql_query for robust reading
-                    df = pd.read_sql_query(f'SELECT * FROM {TRANSFORMED_SCHEMA}."{transformed_table_name}"', conn)
+                # Refresh check for coordinates after ALTER
+                coords_result = conn.execute(has_coords_query, {'schema': TRANSFORMED_SCHEMA, 'table': table_name}).fetchall()
+                has_lat = any(row[0].lower() == 'latitude' for row in coords_result)
+                has_long = any(row[0].lower() == 'longitude' for row in coords_result)
+                if not (has_lat and has_long):
+                    dag_logger.warning(f"Table {table_name} still missing latitude or longitude columns after attempt to add. Skipping geocoding.")
+                    continue
 
-                    if df.empty:
-                        dag_logger.info(f"Table {TRANSFORMED_SCHEMA}.{transformed_table_name} is empty. No geocoding needed.")
-                        continue
-                    
-                    if address_column not in df.columns:
-                        dag_logger.warning(f"Address column '{address_column}' not found in {TRANSFORMED_SCHEMA}.{transformed_table_name}. Skipping.")
-                        continue
-                    
-                    dag_logger.info(f"Found {len(df)} records in {transformed_table_name}.")
+                # Check if the table has latitude and longitude columns but they are NULL
+                has_null_coords_query = sqlalchemy.text(
+                    f"SELECT EXISTS ("
+                    f"    SELECT 1 FROM {TRANSFORMED_SCHEMA}.{table_name}"
+                    f"    WHERE latitude IS NULL OR longitude IS NULL"
+                    f"    LIMIT 1"
+                    f")"
+                )
+                has_null_coords = conn.execute(has_null_coords_query).scalar_one_or_none()
 
-                    unique_addresses = preprocess_addresses(df, address_column)
-                    
-                    if not unique_addresses.size: # Check if unique_addresses is empty (it's a numpy array from .unique())
-                         dag_logger.info(f"No unique addresses to geocode in {transformed_table_name}.")
-                         continue
+                if not has_null_coords:
+                    dag_logger.info(f"Table {table_name} has coordinates for all rows. Skipping geocoding.")
+                    continue
 
-                    # Geocode (max_workers and batch_size can be configured via Airflow variables if needed)
-                    coordinate_results = geocode_batch_parallel(
-                        list(unique_addresses), # Ensure it's a list
-                        max_workers=context.get('params', {}).get('geocoding_max_workers', 4), # Example of using params
-                        batch_size=context.get('params', {}).get('geocoding_batch_size', 50)
-                    )
-                    
-                    df = apply_coordinates_to_dataframe(df, address_column, coordinate_results)
-                    
-                    successful_geocodes = df['latitude'].notna().sum()
-                    total_unique_addresses = len(unique_addresses)
-                    success_rate = (successful_geocodes / total_unique_addresses * 100) if total_unique_addresses > 0 else 0.0
-                    dag_logger.info(f"Successfully geocoded {successful_geocodes}/{total_unique_addresses} unique addresses for {transformed_table_name}.")
-                    dag_logger.info(f"Success rate: {success_rate:.1f}%")
+                # Get the address column
+                address_query = sqlalchemy.text(
+                    """SELECT column_name FROM information_schema.columns 
+                    WHERE table_schema = :schema 
+                    AND table_name = :table 
+                    AND column_name = 'address'"""
+                )
+                address_result = conn.execute(address_query, {'schema': TRANSFORMED_SCHEMA, 'table': table_name})
+                address_column = address_result.scalar_one_or_none()
 
-                    # Write back to DB, replacing the existing table
-                    dag_logger.info(f"Writing geocoded data back to {TRANSFORMED_SCHEMA}.{transformed_table_name}")
-                    with conn.begin(): # Ensure write is in a transaction
-                        # Drop existing table first to avoid conflicts with data types or constraints
-                        conn.execute(sqlalchemy.text(f'DROP TABLE IF EXISTS {TRANSFORMED_SCHEMA}."{transformed_table_name}" CASCADE;'))
-                        df.to_sql(
-                            name=transformed_table_name,
-                            con=conn, # Use the connection object
-                            schema=TRANSFORMED_SCHEMA,
-                            if_exists='append', # Should be 'append' after explicit drop, or 'replace' if not dropping
-                            index=False,
-                            method='multi' # Consistent with db_utils
+                if not address_column:
+                    dag_logger.warning(f"Could not find address column in {table_name}. Skipping geocoding.")
+                    continue
+
+                # Get addresses that need geocoding
+                addresses_query = sqlalchemy.text(
+                    f"SELECT DISTINCT {address_column} FROM {TRANSFORMED_SCHEMA}.{table_name} "
+                    f"WHERE latitude IS NULL OR longitude IS NULL"
+                )
+                addresses_result = conn.execute(addresses_query)
+                addresses = [row[0] for row in addresses_result]
+
+                if not addresses:
+                    dag_logger.info(f"No addresses found in {table_name} that need geocoding. Skipping.")
+                    continue
+
+                dag_logger.info(f"Found {len(addresses)} unique addresses to geocode in {table_name}")
+
+                # Geocode addresses in batches
+                batch_size = 100
+                num_batches = (len(addresses) + batch_size - 1) // batch_size
+
+                for batch_idx in range(num_batches):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min(start_idx + batch_size, len(addresses))
+                    batch_addresses = addresses[start_idx:end_idx]
+
+                    dag_logger.info(f"Geocoding batch {batch_idx + 1}/{num_batches} ({len(batch_addresses)} addresses)")
+
+                    try:
+                        # Geocode the addresses
+                        coordinates = geocode_batch_parallel(batch_addresses)
+                        
+                        # Update the table with coordinates
+                        update_query = sqlalchemy.text(
+                            f"UPDATE {TRANSFORMED_SCHEMA}.{table_name} "
+                            f"SET latitude = :lat, longitude = :lon "
+                            f"WHERE {address_column} = :address "
+                            f"AND (latitude IS NULL OR longitude IS NULL)"
                         )
-                    dag_logger.info(f"Finished geocoding for {transformed_table_name}.")
+
+                        for address, (lat, lon) in coordinates.items():
+                            if lat is not None and lon is not None:
+                                conn.execute(update_query, {
+                                    'lat': lat,
+                                    'lon': lon,
+                                    'address': address
+                                })
+                        
+                        # conn.commit()  # Removed: not available on SQLAlchemy connection object
+                        dag_logger.info(f"Successfully updated coordinates for batch {batch_idx + 1}")
+
+                    except Exception as e:
+                        dag_logger.error(f"Error geocoding batch {batch_idx + 1}: {e}")
+                        # conn.rollback()  # Removed: not available on SQLAlchemy connection object
 
             except Exception as e:
-                dag_logger.error(f"Error during geocoding for {dataset_key} ({transformed_table_name}): {e}", exc_info=True)
-                # Optionally re-raise to fail the task: raise
+                dag_logger.error(f"Error processing table {table_name}: {e}")
+                continue
 
-    dag_logger.info("Geocoding process for transformed data finished.")
+    dag_logger.info("Geocoding completed.")
 
 
 default_args_transforms = { #
@@ -301,11 +430,11 @@ with DAG(
 
     # New Geocoding Task
     geocode_data = PythonOperator(
-        task_id='geocode_transformed_data',
-        python_callable=geocode_transformed_data_func,
-        # You can pass params for geocoding workers/batch_size if needed
-        # params={'geocoding_max_workers': 4, 'geocoding_batch_size': 50},
-    )
+    task_id='geocode_transformed_data',
+    python_callable=geocode_transformed_data_func,
+    op_kwargs={'max_workers': 12, 'batch_size': 100},
+)
 
     # Define dependencies
-    [wait_for_quebec_data, wait_for_ontario_data] >> check_tables >> run_transformations >> geocode_data #
+    wait_for_quebec_data  >> check_tables >> run_transformations >> geocode_data
+    wait_for_ontario_data >> check_tables >> run_transformations >> geocode_data 
