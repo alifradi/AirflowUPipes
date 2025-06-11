@@ -265,6 +265,40 @@ def fetch_and_store_ontario_dataset(
         # Convert all columns to string before writing
         df = df.astype(str).replace({"nan": np.nan, "None": np.nan})
         df = df.applymap(lambda x: str(x) if pd.notna(x) else None)
+        if package_id=="neighbourhood-profiles":
+            df = df.melt(
+                id_vars=["_id", "Category", "Topic", "Data Source", "Characteristic", "Attribute"], 
+                var_name="Neighborhood", 
+                value_name="record"
+            ).drop(columns=["Data Source"])
+        if package_id=="neighbourhood-crime-rates":
+            id_vars = ['_id', 'AREA_NAME', 'HOOD_ID', 'POPULATION_2024', 'geometry']
+
+            # Melt the dataframe into long format
+            melted = df.melt(
+                id_vars=id_vars,
+                var_name='column',
+                value_name='value'
+            )
+
+            # Extract metric, crime, and year from the column name
+            melted['metric'] = melted['column'].apply(lambda x: 'rate' if 'RATE' in x else 'count')
+            melted['crime'] = melted['column'].apply(
+                lambda x: x.split('_RATE_')[0] if 'RATE' in x else x.split('_')[0]
+            )
+            melted['year'] = melted['column'].str.split('_').str[-1]
+
+            # Pivot to get count and rate as separate columns
+            pivoted = melted.pivot(
+                index=id_vars + ['crime', 'year'],
+                columns='metric',
+                values='value'
+            ).reset_index()
+
+            # Clean up column names
+            pivoted.columns.name = None
+            df = pivoted.rename_axis(None, axis=1)
+
         df.to_csv(csv_path, encoding='utf-8-sig', index=False)
         if connection and table_name:
             logger.info(f"Writing to Postgres in chunks: {table_name}")
@@ -297,7 +331,7 @@ TO_MAP = {
     },
      'to_fines_food': {
         'resource_id': 'dinesafe',
-        'has_coords': False
+        'has_coords': True
     },
      'to_food_establishments': {
         'resource_id': 'cafeto-curb-lane-parklet-cafe-locations',
