@@ -453,10 +453,6 @@ TO_MAP = {
         'resource_id': 'on-street-permit-parking-area-maps',
         'has_coords': False
     },
-     'to_property_boundaries': {
-        'resource_id': 'property-boundaries',
-        'has_coords': False
-    },
      'to_green_energy_installations': {
         'resource_id': 'renewable-energy-installations',
         'has_coords': False
