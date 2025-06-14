@@ -103,69 +103,30 @@ def run_sql_transformations_func(**context):
                     sql_template = Template(f.read())
                     sql_content = sql_template.render(data_pull_date=data_pull_date)
 
-                individual_select_queries = []
-                current_query_lines = []
-                for line in sql_content.splitlines():
-                    stripped_line = line.strip()
-                    if (stripped_line.upper().startswith("SELECT") or stripped_line.upper().startswith("WITH")) and current_query_lines:
-                        if "".join(current_query_lines).strip():
-                            individual_select_queries.append("\n".join(current_query_lines))
-                        current_query_lines = [line]
-                    elif stripped_line or current_query_lines:
-                        current_query_lines.append(line)
-                if current_query_lines and "".join(current_query_lines).strip():
-                    individual_select_queries.append("\n".join(current_query_lines))
+                # Split SQL script by semicolon (standard SQL statement delimiter)
+                individual_select_queries = [q.strip() for q in sql_content.split(';') if q.strip()]
 
                 if not individual_select_queries:
                     dag_logger.info(f"No SQL queries found in the file {SQL_FILE_PATH}.")
                     continue
 
-                for i, select_query in enumerate(individual_select_queries):
-                    select_query = select_query.strip()
-                    if not select_query:
-                        continue
-                    # Skip queries that are only comments or blank lines
-                    lines = [line.strip() for line in select_query.splitlines() if line.strip()]
-                    if not lines or all(line.startswith('--') for line in lines):
-                        dag_logger.info(f"Skipping comment-only or empty query block at position {i+1} in {os.path.basename(SQL_FILE_PATH)}.")
-                        continue
-
-                    dag_logger.info(f"\nProcessing query {i+1}/{len(individual_select_queries)} from {os.path.basename(SQL_FILE_PATH)}:\n{select_query[:200]}...")
-
-                    # Get source table name and schema
-                    source_table_name_in_sql = None
-                    # Match table names with or without quotes
-                    from_match = re.search(r"FROM\s+([\w\"]+(?:\.[\w\"]+)?)", select_query, re.IGNORECASE)
-                    if from_match:
-                        source_table_name_in_sql = from_match.group(1).strip('"')
-                    else:
-                        # Also check for table names in WITH clauses
-                        with_from_match = re.search(r"WITH\s+\w+\s+AS\s*\(\s*SELECT.*?\sFROM\s+([\w\"]+(?:\.[\w\"]+)?)", select_query, re.DOTALL | re.IGNORECASE)
-                        if with_from_match:
-                            source_table_name_in_sql = with_from_match.group(1).strip('"')
-                    if not source_table_name_in_sql:
-                        dag_logger.warning(f"WARNING: Could not determine a base table name for query: {select_query[:100]}... Using generic name 'transformed_query_{i+1}'.")
-                        transformed_table_name = f"transformed_query_{i+1}"
-                    else:
-                        transformed_table_name = f"tf_{source_table_name_in_sql.split('.')[-1].replace('"', '')}"
-
-                    # Drop existing transformed table first
-                    drop_sql = f"DROP TABLE IF EXISTS {TRANSFORMED_SCHEMA}.{transformed_table_name} CASCADE;"
-                    dag_logger.info(f"Executing: {drop_sql}")
-                    execute_sql_statement(drop_sql, conn)
-
-                    # Create transformed table
-                    create_sql = f"""
-                        CREATE TABLE {TRANSFORMED_SCHEMA}.{transformed_table_name} AS
-                        {select_query}
-                    """
-                    dag_logger.info(f"Creating transformed table: {transformed_table_name}")
-                    try:
-                        execute_sql_statement(create_sql, conn)
-                        dag_logger.info(f"Successfully created table {TRANSFORMED_SCHEMA}.{transformed_table_name}")
-                    except Exception as e:
-                        dag_logger.error(f"ERROR creating table {TRANSFORMED_SCHEMA}.{transformed_table_name}: {e}")
-                        continue
+                dag_logger.info(f"Executing entire SQL script for {os.path.basename(SQL_FILE_PATH)}")
+                try:
+                    queries = [q.strip() for q in sql_content.split(';') if q.strip()]
+                    for i, query in enumerate(queries, 1):
+                        if not query or all(line.strip().startswith('--') for line in query.splitlines() if line.strip()):
+                            dag_logger.info(f"Skipping comment-only or empty query block at position {i} in {os.path.basename(SQL_FILE_PATH)}.")
+                            continue
+                        try:
+                            dag_logger.info(f"Executing query {i}/{len(queries)} from {os.path.basename(SQL_FILE_PATH)}:\n{query[:200]}...")
+                            execute_sql_statement(query, conn)
+                            dag_logger.info(f"Successfully executed query {i}")
+                        except Exception as e:
+                            dag_logger.error(f"Error executing query {i}: {str(e)}")
+                            raise
+                except Exception as e:
+                    dag_logger.error(f"Error executing SQL transformations: {str(e)}")
+                    raise
 
             dag_logger.info("All SQL file transformations completed.")
 
