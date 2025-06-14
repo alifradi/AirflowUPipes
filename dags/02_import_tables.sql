@@ -51,6 +51,7 @@ CSV HEADER
 ENCODING 'utf8'
 NULL '';
 
+
 COPY mtl_financial_help(
 "_id",titre,url_fiche,service_publieur,date_cree,"type",statut
 )
